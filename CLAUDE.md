@@ -8,6 +8,15 @@ Whenever working with this codebase (or any codebase), ALWAYS ask me first about
 
 ALWAYS show me the code/implementation without me having to type `/plan` myself.
 
+## Architecture
+
+This is a **Kafka broker implementation in C++23**. The server listens on port 9092 (standard Kafka broker port) for TCP connections.
+
+**Current state**: Early development - basic TCP socket server skeleton is implemented. The Kafka protocol layer (message parsing, topic management, consumer groups, etc.) is not yet implemented.
+
+**Main components**:
+- `src/main.cpp` - TCP server that binds to port 9092, accepts connections, and handles socket lifecycle
+
 ## Build Commands
 
 ```bash
@@ -18,8 +27,10 @@ nix develop
 cmake . -B build
 cmake --build build
 
+# Run the server
+./build/src/main
+
 # Run tests (GTest) - Note: tests directory currently commented out in CMakeLists.txt
-cmake --build build
 ctest --test-dir build
 
 # Run a single test
