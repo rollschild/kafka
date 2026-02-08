@@ -9,6 +9,7 @@
 #include <cstring>
 #include <iostream>
 #include <string>
+#include <thread>
 #include <vector>
 
 // the ApiVersions request
@@ -523,9 +524,11 @@ int main(/* int argc, char* argv[] */) {
             continue;
         }
         std::cout << "Client connected\n";
-        handle_client(client_fd);
-        close(client_fd);
-        std::cerr << "Client disconnected\n";
+        std::thread([client_fd]() {
+            handle_client(client_fd);
+            close(client_fd);
+            std::cerr << "Client disconnected\n";
+        }).detach();
     }
 
     close(server_fd);
