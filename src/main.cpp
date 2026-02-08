@@ -11,15 +11,37 @@
 #include <string>
 #include <vector>
 
+// the ApiVersions request
 constexpr int16_t API_VERSIONS = 18;
+
 constexpr int16_t ERROR_NONE = 0;
 constexpr int16_t ERROR_UNSUPPORTED_VERSION = 35;
+
+/**
+ * Full wire format for ApiVersions Request v4:
+ * - Message size (4 bytes, big endian)
+ * - Request Header v2
+ *   - request_api_key
+ *   - request_api_version
+ *   - correlation_id
+ *   - client_id
+ *   - TAG_BUFFER
+ * - Request body
+ *   - client_software_name (COMPACT_STRING)
+ *   - client_software_version (COMPACT_STRING)
+ *   - TAG_BUFFER
+ */
 
 struct RequestHeader {
     int16_t request_api_key;
     int16_t request_api_version;
     int32_t correlation_id;
     std::string client_id;
+};
+
+struct ApiVersionsRequestBody {
+    std::string client_software_name;
+    std::string client_softare_version;
 };
 
 struct ApiVersionRange {
@@ -73,8 +95,11 @@ bool write_exact(int fd, const uint8_t* buffer, size_t n) {
     return true;
 }
 
-bool parse_request_header(const uint8_t* data, size_t len,
-                          RequestHeader& header) {
+/**
+ * Used for ApiVersion v0-2
+ */
+bool parse_request_header_v1(const uint8_t* data, size_t len,
+                             RequestHeader& header, size_t& offset) {
     if (len < 8) {
         // api_key (2) + api_version (2) + correlation_id (4)
         return false;
@@ -83,27 +108,200 @@ bool parse_request_header(const uint8_t* data, size_t len,
     header.request_api_version = (data[2] << 8) | data[3];
     header.correlation_id =
         (data[4] << 24) | (data[5] << 16) | (data[6] << 8) | data[7];
+    offset = 8;
 
     // for v2
-    if (len < 10) {
+    if (len < offset + 2) {
         // need at least 2 more bytes for client_id length
         // in kafka's protocol, a NULLABLE_STRING is encoded as:
         //   - int16 (2 bytes) - length of the string
         //   - N bytes
         return false;
     }
-    int16_t client_id_len = (data[8] << 8) | data[9];
+    int16_t client_id_len = (data[offset] << 8) | data[offset + 1];
+    offset += 2;
+
     if (client_id_len == -1) {
         header.client_id = "";  // null string
     } else if (client_id_len >= 0) {
-        if (len < 10 + static_cast<size_t>(client_id_len)) {
+        if (len < offset + static_cast<size_t>(client_id_len)) {
             return false;
         }
-        header.client_id = std::string(reinterpret_cast<const char*>(data + 10),
-                                       client_id_len);
+        header.client_id = std::string(
+            reinterpret_cast<const char*>(data + offset), client_id_len);
+        offset += client_id_len;
     } else {
         return false;
     }
+    return true;
+}
+
+/**
+ * Read unsigned varint from buffer
+ * Returns number of bytes consumed, 0 on error
+ * Unsigned varint:
+ *   - space-efficient encoding
+ *   - smaller numbers use fewer bytes
+ *   - 7 bits for data
+ *   - 1 bit (MSB/high bit) as a continuation flag
+ *     - 1 = more bytes follow
+ *     - 0 = last byte
+ * varints are LITTLE ENDIAN!
+ */
+size_t read_unsigned_varint(const uint8_t* data, size_t len, size_t offset,
+                            uint32_t& value) {
+    value = 0;
+    int shift = 0;
+    size_t bytes_read = 0;
+    while (offset + bytes_read < len) {
+        uint8_t b = data[offset + bytes_read];
+        bytes_read++;
+        // shifting to left since the bytes arrive in little-endian order
+        // here, least significant bits come first
+        value |= static_cast<uint32_t>(b & 0x7F) << shift;
+        if ((b & 0x80) == 0) {  // highest bit is 0
+            return bytes_read;
+        }
+        shift += 7;
+        if (shift > 28) {
+            return 0;  // overflow
+        }
+    }
+    return 0;  // incomplete
+}
+
+/**
+ * Read COMPACT_NULLABLE_STRING from buffer
+ * Encoding: unsigned varint length (0=null, N=N-1 chars) + data
+ */
+bool read_compact_nullable_string(const uint8_t* data, size_t len,
+                                  size_t& offset, std::string& out) {
+    uint32_t length;
+    size_t varint_bytes = read_unsigned_varint(data, len, offset, length);
+    if (varint_bytes == 0) {
+        return false;
+    }
+    offset += varint_bytes;
+
+    if (length == 0) {
+        out = "";  // null string
+        return true;
+    }
+
+    // COMPACT encoding: actual_length = encoded_length - 1
+    // convetion of Kafka
+    // encoded_length = 0 means null (no string at all)
+    // encoded_length = 1 means string of length 0 (empty string "")
+    length--;
+    if (offset + length > len) {
+        return false;
+    }
+
+    out = std::string(reinterpret_cast<const char*>(data + offset), length);
+    offset += length;
+    return true;
+}
+
+/**
+ * Skip TAG_BUFFER in buffer
+ * Encoding: unsigned varint num_fields, then for each field:
+ *   - tag (uvarint)
+ *   - size (uvarint)
+ *   - data (size bytes)
+ */
+bool skip_tag_buffer(const uint8_t* data, size_t len, size_t& offset) {
+    uint32_t num_tags;
+    size_t varint_bytes = read_unsigned_varint(data, len, offset, num_tags);
+    if (varint_bytes == 0) {
+        return false;
+    }
+    offset += varint_bytes;
+
+    for (uint32_t i = 0; i < num_tags; ++i) {
+        uint32_t tag, size;
+        varint_bytes = read_unsigned_varint(data, len, offset, tag);
+        if (varint_bytes == 0) {
+            return false;
+        }
+        offset += varint_bytes;
+
+        varint_bytes = read_unsigned_varint(data, len, offset, size);
+        if (varint_bytes == 0) {
+            return false;
+        }
+        offset += varint_bytes;
+
+        if (offset + size > len) {
+            return false;
+        }
+        offset += size;
+    }
+    return true;
+}
+
+/**
+ * parse request header v2 (flexible)
+ * used for ApiVersions v3
+ */
+bool parse_request_header_v2(const uint8_t* data, size_t len,
+                             RequestHeader& header, size_t& offset) {
+    if (len < 8) {
+        // api_key (2) + api_version (2) + correlation_id (4)
+        return false;
+    }
+    header.request_api_key = (data[0] << 8) | data[1];
+    header.request_api_version = (data[2] << 8) | data[3];
+    header.correlation_id =
+        (data[4] << 24) | (data[5] << 16) | (data[6] << 8) | data[7];
+    offset = 8;
+
+    // regular NULLABLE_STRING for client_id
+    if (len < offset + 2) return false;
+    int16_t client_id_len = (data[offset] << 8) | data[offset + 1];
+    offset += 2;
+    if (client_id_len == -1) {
+        header.client_id = "";  // null string
+    } else if (client_id_len >= 0) {
+        if (len < offset + static_cast<size_t>(client_id_len)) {
+            return false;
+        }
+        header.client_id = std::string(
+            reinterpret_cast<const char*>(data + offset), client_id_len);
+        offset += client_id_len;
+    } else {
+        return false;
+    }
+
+    // TAG_BUFFER in header
+    if (!skip_tag_buffer(data, len, offset)) {
+        return false;
+    }
+
+    return true;
+}
+
+/**
+ * Parse ApiVersions request body v3+
+ */
+bool parse_api_versions_request_body_v3(const uint8_t* data, size_t len,
+                                        size_t offset,
+                                        ApiVersionsRequestBody& body) {
+    // client_software_name (COMPACT_STRING)
+    if (!read_compact_nullable_string(data, len, offset,
+                                      body.client_software_name)) {
+        return false;
+    }
+    // client_software_version (COMPACT_STRING)
+    if (!read_compact_nullable_string(data, len, offset,
+                                      body.client_softare_version)) {
+        return false;
+    }
+
+    // TAG_BUFFER
+    if (!skip_tag_buffer(data, len, offset)) {
+        return false;
+    }
+
     return true;
 }
 
@@ -142,16 +340,20 @@ std::vector<uint8_t> build_api_versions_response_v4(int16_t error_code) {
     body.push_back((error_code >> 8) & 0xFF);
     body.push_back(error_code & 0xFF);
 
-    // COMPACT_ARRAY
+    // api_keys COMPACT_ARRAY: length = N + 1
     body.push_back(static_cast<uint8_t>(SUPPORTED_API_VERSIONS.size() + 1));
 
     for (const auto& api : SUPPORTED_API_VERSIONS) {
+        // api_key (int16)
         body.push_back((api.api_key >> 8) & 0xFF);
-        body.push_back(api.api_key >> 8 & 0xFF);
+        body.push_back(api.api_key & 0xFF);
+        // min_version (int16)
         body.push_back((api.min_version >> 8) & 0xFF);
         body.push_back(api.min_version & 0xFF);
+        // max_version (int16)
         body.push_back((api.max_version >> 8) & 0xFF);
         body.push_back(api.max_version & 0xFF);
+        // TAG_BUFFER (empty)
         body.push_back(0x00);  // TAG_BUFFER
     }
 
@@ -191,10 +393,36 @@ void handle_client(int client_fd) {
         }
 
         // parse request header
-        RequestHeader header;
-        if (!parse_request_header(request.data(), request.size(), header)) {
-            std::cerr << "Failed to parse request header!" << std::endl;
+        // need to peek at api_version to decide header format
+        // first read fixed header fields to get api_version
+        if (request.size() < 4) {
+            // peek at least api_key and api_version
+            std::cerr << "Request too small!" << std::endl;
             break;
+        }
+
+        int16_t api_key = (request[0] << 8) | request[1];
+        int16_t api_version = (request[2] << 8) | request[3];
+        RequestHeader header;
+        size_t header_end_offset = 0;
+
+        // ApiVersions v3+ uses flexible header (v2), v0-2 uses non-flexible
+        // (v1)
+        bool use_flexible_header =
+            (api_key == API_VERSIONS && api_version >= 3);
+        if (use_flexible_header) {
+            if (!parse_request_header_v2(request.data(), request.size(), header,
+                                         header_end_offset)) {
+                std::cerr << "Failed to parse request header v2!" << std::endl;
+                break;
+            }
+
+        } else {
+            if (!parse_request_header_v1(request.data(), request.size(), header,
+                                         header_end_offset)) {
+                std::cerr << "Failed to parse request header v1!" << std::endl;
+                break;
+            }
         }
 
         std::cerr << "Received request: api_key=" << header.request_api_key
@@ -204,6 +432,22 @@ void handle_client(int client_fd) {
 
         // build and send response with header v0 (empty body for now)
         if (header.request_api_key == API_VERSIONS) {
+            // parse request body for v3+
+            if (header.request_api_version >= 3) {
+                ApiVersionsRequestBody req_body;
+                if (!parse_api_versions_request_body_v3(
+                        request.data(), request.size(), header_end_offset,
+                        req_body)) {
+                    std::cerr << "Failed to parse ApiVersions request body!"
+                              << std::endl;
+                    break;
+                }
+
+                std::cerr << "  client_software_name="
+                          << req_body.client_software_name
+                          << " client_software_version="
+                          << req_body.client_softare_version << std::endl;
+            }
             int16_t error_code =
                 is_version_supported(header.request_api_key,
                                      header.request_api_version)
