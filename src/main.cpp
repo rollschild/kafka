@@ -10,10 +10,14 @@
 #include <iostream>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
 // the ApiVersions request
 constexpr int16_t API_VERSIONS = 18;
+// DescribeTopicPartitions
+constexpr int16_t DESCRIBE_TOPIC_PARTITIONS = 75;
+constexpr int16_t ERROR_UNKNOWN_TOPIC_OR_PARTITION = 3;
 
 constexpr int16_t ERROR_NONE = 0;
 constexpr int16_t ERROR_UNSUPPORTED_VERSION = 35;
@@ -53,7 +57,37 @@ struct ApiVersionRange {
 
 const std::vector<ApiVersionRange> SUPPORTED_API_VERSIONS = {
     {API_VERSIONS, 0, 4},
+    {DESCRIBE_TOPIC_PARTITIONS, 0, 0},
     // add more here
+};
+
+/**
+ DescribeTopicPartitions Request (API key 75, version 0), using flexible header
+ v2
+
+  Message size (4 bytes, big-endian)
+  Request Header v2:
+    request_api_key (INT16)
+    request_api_version (INT16)
+    correlation_id (INT32)
+    client_id (NULLABLE_STRING - int16 length prefix)
+    TAG_BUFFER
+  Request Body:
+    topics (COMPACT_ARRAY):
+      for each topic:
+        name (COMPACT_STRING)
+        TAG_BUFFER
+    response_partition_limit (INT32)
+    cursor (nullable struct):
+      0xff = null, otherwise:
+        topic_name (COMPACT_STRING)
+        partition_index (INT32)
+        TAG_BUFFER
+    TAG_BUFFER
+*/
+struct DescribeTopicPartitionsRequest {
+    std::vector<std::string> topic_names;
+    int32_t response_partition_limit;
 };
 
 bool is_version_supported(int16_t api_key, int16_t version) {
@@ -306,6 +340,169 @@ bool parse_api_versions_request_body_v3(const uint8_t* data, size_t len,
     return true;
 }
 
+bool parse_describe_topic_partitions_request(
+    const uint8_t* data, size_t len, size_t offset,
+    DescribeTopicPartitionsRequest& req) {
+    // topics: COMPACT_ARRAY
+    uint32_t num_topics_raw;
+    size_t varint_bytes =
+        read_unsigned_varint(data, len, offset, num_topics_raw);
+    if (varint_bytes == 0) {
+        return false;
+    }
+    offset += varint_bytes;
+
+    if (num_topics_raw > 0) {
+        uint32_t num_topics = num_topics_raw - 1;
+        for (uint32_t i = 0; i < num_topics; ++i) {
+            std::string topic_name;
+            if (!read_compact_nullable_string(data, len, offset, topic_name)) {
+                return false;
+            }
+            req.topic_names.push_back(std::move(topic_name));
+
+            // TAG_BUFFER per topic entry
+            if (!skip_tag_buffer(data, len, offset)) {
+                return false;
+            }
+        }
+    }
+
+    // response_partition_limit (INT32)
+    // tells the broker the max number of partitions the client wants back
+    // across all topics
+    if (offset + 4 > len) {
+        return false;
+    }
+    req.response_partition_limit = (data[offset] << 24) |
+                                   (data[offset + 1] << 16) |
+                                   (data[offset + 2] << 8) | data[offset + 3];
+    offset += 4;
+
+    // cursor (nullable struct)
+    // a nullable struct for pagination
+    // the first byte indicates presense: 0xff = null
+    // anything else = curour is present, meaning the client is continuing a
+    // previous paginated response
+    if (offset >= len) {
+        return false;
+    }
+    uint8_t cursor_tag = data[offset];
+    offset++;
+    if (cursor_tag != 0xff) {
+        // cursor present - skip topic_name + partition_index + TAG_BUFFER
+        std::string cursor_topic;
+        if (!read_compact_nullable_string(data, len, offset, cursor_topic)) {
+            return false;
+        }
+        if (offset + 4 > len) {
+            return false;
+        }
+        offset += 4;
+        if (!skip_tag_buffer(data, len, offset)) {
+            return false;
+        }
+    }
+
+    // TAG_BUFFER
+    if (!skip_tag_buffer(data, len, offset)) {
+        return false;
+    }
+
+    return true;
+}
+
+/**
+ DescribeTopicPartitions response, using response header v1:
+
+  Message size (4 bytes, big-endian)
+  Response Header v1:
+    correlation_id (INT32)
+    TAG_BUFFER
+  Response Body:
+    throttle_time_ms (INT32)
+    topics (COMPACT_ARRAY):
+      for each topic:
+        error_code (INT16)
+        name (COMPACT_NULLABLE_STRING)
+        topic_id (UUID - 16 bytes)
+        is_internal (BOOLEAN)
+        partitions (COMPACT_ARRAY):
+          for each partition:
+            error_code (INT16)
+            partition_index (INT32)
+            leader_id (INT32)
+            leader_epoch (INT32)
+            replica_nodes (COMPACT_ARRAY of INT32)
+            isr_nodes (COMPACT_ARRAY of INT32)
+            eligible_leader_replicas (COMPACT_ARRAY of INT32)
+            last_known_elr (COMPACT_ARRAY of INT32)
+            offline_replicas (COMPACT_ARRAY of INT32)
+            TAG_BUFFER
+        topic_authorized_operations (INT32)
+        TAG_BUFFER
+    next_cursor (nullable struct):
+      0xff = null, otherwise:
+        topic_name (COMPACT_STRING)
+        partition_index (INT32)
+        TAG_BUFFER
+    TAG_BUFFER
+*/
+std::vector<uint8_t> build_describe_topic_partitions_response(
+    const DescribeTopicPartitionsRequest& req) {
+    std::vector<uint8_t> body;
+
+    // throttle_time_ms (INT32)
+    // NO throttling
+    body.push_back(0x00);
+    body.push_back(0x00);
+    body.push_back(0x00);
+    body.push_back(0x00);
+
+    // topics: COMPACT_ARRAY (length = N - 1)
+    body.push_back(static_cast<uint8_t>(req.topic_names.size() + 1));
+
+    for (const auto& topic_name : req.topic_names) {
+        // error_code (INT16)
+        // because NO topics actually exist in this broker
+        body.push_back((ERROR_UNKNOWN_TOPIC_OR_PARTITION >> 8) & 0xFF);
+        body.push_back(ERROR_UNKNOWN_TOPIC_OR_PARTITION & 0xFF);
+
+        // name: COMPACT_NULLABLE_STRING
+        // actual len is encoded as len + 1, as 0 is reserved for null
+        body.push_back(static_cast<uint8_t>(topic_name.size() + 1));
+        body.insert(body.end(), topic_name.begin(), topic_name.end());
+
+        // topic_id: UUID (16 bytes of zeros)
+        for (int i = 0; i < 16; ++i) {
+            body.push_back(0x00);  // since topic does not exist
+        }
+
+        // is_interal: BOOLEAN (false)
+        body.push_back(0x00);
+
+        // partitions: COMPACT_ARRAY (empty = 1, meaning 0 elements)
+        body.push_back(0x01);
+
+        // topic_authorized_operations: INT32
+        body.push_back(0x00);
+        body.push_back(0x00);
+        body.push_back(0x00);
+        body.push_back(0x00);
+
+        // TAG_BUFFER
+        body.push_back(0.00);
+    }
+
+    // next_cursor: null
+    body.push_back(0xff);
+
+    // TAG_BUFFER
+    body.push_back(0.00);
+
+    return body;
+}
+
 /**
  * Build response with header v0 (just correlation_id) and optional body
  */
@@ -370,6 +567,43 @@ std::vector<uint8_t> build_api_versions_response_v4(int16_t error_code) {
     return body;
 }
 
+bool uses_flexible_header(int16_t api_key, int16_t api_version) {
+    if (api_key == API_VERSIONS) return api_version > 3;
+    if (api_key == DESCRIBE_TOPIC_PARTITIONS) return true;
+    return false;
+}
+
+std::vector<uint8_t> build_response_v1(int32_t correlation_id,
+                                       const std::vector<uint8_t>& body = {}) {
+    // message_size + correlation_id + TAG_BUFFER + body
+    // extra 1 byte is TAG_BUFFER
+    int32_t message_size = 4 + 1 + body.size();
+
+    std::vector<uint8_t> res;
+    res.reserve(4 +
+                message_size);  // 4 bytes for the actual message_size itself
+
+    // message size
+    res.push_back((message_size >> 24) & 0xFF);
+    res.push_back((message_size >> 16) & 0xFF);
+    res.push_back((message_size >> 8) & 0xFF);
+    res.push_back(message_size & 0xFF);
+
+    // correlation_id
+    res.push_back((correlation_id >> 24) & 0xFF);
+    res.push_back((correlation_id >> 16) & 0xFF);
+    res.push_back((correlation_id >> 8) & 0xFF);
+    res.push_back(correlation_id & 0xFF);
+
+    // TAG_BUFFER
+    res.push_back(0x00);
+
+    // body
+    res.insert(res.end(), body.begin(), body.end());
+
+    return res;
+}
+
 void handle_client(int client_fd) {
     while (true) {
         // read message size (4 bytes, big-endian)
@@ -409,8 +643,7 @@ void handle_client(int client_fd) {
 
         // ApiVersions v3+ uses flexible header (v2), v0-2 uses non-flexible
         // (v1)
-        bool use_flexible_header =
-            (api_key == API_VERSIONS && api_version >= 3);
+        bool use_flexible_header = uses_flexible_header(api_key, api_version);
         if (use_flexible_header) {
             if (!parse_request_header_v2(request.data(), request.size(), header,
                                          header_end_offset)) {
@@ -460,6 +693,29 @@ void handle_client(int client_fd) {
                 build_response(header.correlation_id, body);
             if (!write_exact(client_fd, res.data(), res.size())) {
                 std::cerr << "Failed to send response" << std::endl;
+                break;
+            }
+        } else if (header.request_api_key == DESCRIBE_TOPIC_PARTITIONS) {
+            // request body parsing
+            DescribeTopicPartitionsRequest req;
+            if (!parse_describe_topic_partitions_request(
+                    request.data(), request.size(), header_end_offset, req)) {
+                std::cerr << "Failed to parse DescribeTopicPartitions request!"
+                          << std::endl;
+                break;
+            }
+            std::cerr << "  topics requested:";
+            for (const auto& t : req.topic_names) {
+                std::cerr << " " << t;
+            }
+            std::cerr << std::endl;
+
+            std::vector<uint8_t> body =
+                build_describe_topic_partitions_response(req);
+            std::vector<uint8_t> res =
+                build_response_v1(header.correlation_id, body);
+            if (!write(client_fd, res.data(), res.size())) {
+                std::cerr << "Failed to send response!" << std::endl;
                 break;
             }
         }
