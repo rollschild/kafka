@@ -12,7 +12,12 @@ ALWAYS show me the code/implementation without me having to type `/plan` myself.
 
 This is a **Kafka broker implementation in C++23**. The server listens on port 9092 (standard Kafka broker port) for TCP connections.
 
-**Current state**: Early development - single-file implementation in `src/main.cpp`. Handles ApiVersions (API key 18, v0-4) and DescribeTopicPartitions (API key 75, v0). Reads KRaft cluster metadata from `/tmp/kraft-combined-logs/__cluster_metadata-0/00000000000000000000.log` to resolve topic/partition information; returns UNKNOWN_TOPIC_OR_PARTITION for topics not found in that log.
+**Current state**: Early development — single-file implementation in `src/main.cpp` (~1400 lines). Supported APIs:
+- **ApiVersions** (API key 18, v0-4)
+- **DescribeTopicPartitions** (API key 75, v0)
+- **Fetch** (API key 1, v0-16)
+
+Reads KRaft cluster metadata from `/tmp/kraft-combined-logs/__cluster_metadata-0/00000000000000000000.log` to resolve topic/partition information; returns UNKNOWN_TOPIC_OR_PARTITION for topics not found in that log.
 
 **Connection model**: Multi-threaded — the main loop accepts connections and spawns a detached `std::thread` per client. Each thread runs `handle_client` in a loop until the client disconnects.
 
@@ -21,11 +26,11 @@ This is a **Kafka broker implementation in C++23**. The server listens on port 9
 2. Read the full message body
 3. Peek at `api_key` and `api_version` to select header parser via `uses_flexible_header()`:
    - Non-flexible (header v1, `parse_request_header_v1`): ApiVersions v0-3. Fields: api_key, api_version, correlation_id, client_id (NULLABLE_STRING with int16 length prefix)
-   - Flexible (header v2, `parse_request_header_v2`): ApiVersions v4 only, DescribeTopicPartitions (always). Same fields as v1, plus TAG_BUFFER after client_id
+   - Flexible (header v2, `parse_request_header_v2`): ApiVersions v4, DescribeTopicPartitions (always), Fetch v12+. Same fields as v1, plus TAG_BUFFER after client_id
 4. Dispatch to API handler based on api_key
 5. Build response:
    - ApiVersions: response header v0 (`build_response` — just correlation_id) + body
-   - DescribeTopicPartitions: response header v1 (`build_response_v1` — correlation_id + TAG_BUFFER) + body
+   - DescribeTopicPartitions / Fetch: response header v1 (`build_response_v1` — correlation_id + TAG_BUFFER) + body
 
 **Quirk**: ApiVersions v3 uses non-flexible header (v1) but has the v3+ body format (with COMPACT_STRING fields). The `uses_flexible_header()` check is `api_version > 3`, not `>= 3`. The body parser switches at `api_version >= 3`.
 
@@ -47,7 +52,7 @@ This is a **Kafka broker implementation in C++23**. The server listens on port 9
 
 **Note**: CURL is linked as a dependency but not yet used in the code.
 
-**Known issue**: Two places in `build_describe_topic_partitions_response` use the float literal `0.00` instead of `0x00` (lines ~643, ~651 in main.cpp). These compile and work (0.00 truncates to 0) but are technically wrong.
+**Known issue**: Two places in `build_describe_topic_partitions_response` use the float literal `0.00` instead of `0x00` (lines 656, 664 in main.cpp). These compile and work (0.00 truncates to 0) but are technically wrong.
 
 ## Build Commands
 
@@ -62,7 +67,7 @@ cmake --build build
 # Run the server
 ./build/src/main
 
-# Run tests (GTest) - tests directory currently commented out in CMakeLists.txt
+# Run tests (GTest) - no tests/ directory exists yet; add_subdirectory(tests) is commented out in root CMakeLists.txt
 ctest --test-dir build
 
 # Run a single test
@@ -76,7 +81,7 @@ clang-format -i src/*.cpp
 
 - **Language**: C++23 (required standard)
 - **Package Manager**: Nix Flakes
-- **Test Framework**: Google Test (GTest), Catch2 v3 available — `add_subdirectory(tests)` is commented out in root CMakeLists.txt, so no tests compile yet
+- **Test Framework**: Google Test (GTest), Catch2 v3 available — no `tests/` directory exists yet, and `add_subdirectory(tests)` is commented out in root CMakeLists.txt
 - **Code Style**: Google style, 4-space indent (see `.clang-format`)
 
 ## Compiler Configuration

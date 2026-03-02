@@ -22,12 +22,14 @@
 
 // the ApiVersions request
 constexpr int16_t API_VERSIONS = 18;
+constexpr int16_t FETCH = 1;
 // DescribeTopicPartitions
 constexpr int16_t DESCRIBE_TOPIC_PARTITIONS = 75;
 constexpr int16_t ERROR_UNKNOWN_TOPIC_OR_PARTITION = 3;
 
 constexpr int16_t ERROR_NONE = 0;
 constexpr int16_t ERROR_UNSUPPORTED_VERSION = 35;
+constexpr int16_t ERROR_UNKNOWN_TOPIC_ID = 100;
 
 const std::string METADATA_LOG_PATH =
     "/tmp/kraft-combined-logs/__cluster_metadata-0/00000000000000000000.log";
@@ -70,7 +72,16 @@ struct ApiVersionRange {
 const std::vector<ApiVersionRange> SUPPORTED_API_VERSIONS = {
     {API_VERSIONS, 0, 4},
     {DESCRIBE_TOPIC_PARTITIONS, 0, 0},
+    {FETCH, 0, 16},
     // add more here
+};
+
+struct FetchRequestTopic {
+    std::array<uint8_t, 16> topic_id;
+    std::vector<int32_t> partitions;
+};
+struct FetchRequest {
+    std::vector<FetchRequestTopic> topics;
 };
 
 /**
@@ -229,6 +240,15 @@ size_t read_unsigned_varint(const uint8_t* data, size_t len, size_t offset,
         }
     }
     return 0;  // incomplete
+}
+
+void append_unsigned_varint(std::vector<uint8_t>& buf, uint32_t value) {
+    // why?
+    while (value > 0x7F) {
+        buf.push_back(static_cast<uint8_t>((value & 0x7F) | 0x80));
+        value >>= 7;
+    }
+    buf.push_back(static_cast<uint8_t>(value));
 }
 
 /**
@@ -531,7 +551,9 @@ std::vector<uint8_t> build_describe_topic_partitions_response(
     // topics: COMPACT_ARRAY (length = N - 1)
     body.push_back(static_cast<uint8_t>(req.topic_names.size() + 1));
 
-    for (const auto& topic_name : req.topic_names) {
+    std::vector<std::string> sorted_names = req.topic_names;
+    std::sort(sorted_names.begin(), sorted_names.end());
+    for (const auto& topic_name : sorted_names) {
         auto it = metadata.find(topic_name);
         if (it == metadata.end()) {
             // Topic not found - return ERROR_UNKNOWN_TOPIC_OR_PARTITION
@@ -723,6 +745,7 @@ std::vector<uint8_t> build_api_versions_response_v4(int16_t error_code) {
 bool uses_flexible_header(int16_t api_key, int16_t api_version) {
     if (api_key == API_VERSIONS) return api_version > 3;
     if (api_key == DESCRIBE_TOPIC_PARTITIONS) return true;
+    if (api_key == FETCH) return api_version >= 12;
     return false;
 }
 
@@ -860,6 +883,90 @@ bool parse_partition_record(const uint8_t* data, size_t len, size_t offset,
     offset += 4;
 
     return skip_tag_buffer(data, len, offset);
+}
+
+/**
+ * Parse Fetch Request v16 body (after header)
+ * Body layout:
+ *   max_wait_ms (INT32)
+ *   min_bytes (INT32)
+ *   max_bytes (INT32)
+ *   isolation_level (INT8)
+ *   session_id (INT32)
+ *   session_epoch (INT32)
+ *   topics (COMPACT_ARRAY):
+ *     topic_id (UUID, 16 bytes)
+ *     partitions (COMPACT_ARRAY):
+ *       partition (INT32)
+ *       current_leader_epoch (INT32)
+ *       fetch_offset (INT64)
+ *       last_fetched_epoch (INT32)
+ *       log_start_offset (INT64)
+ *       partition_max_bytes (INT32)
+ *       TAG_BUFFER
+ *     TAG_BUFFER
+ *   forgotten_topics_data (COMPACT_ARRAY) — skipped
+ *   rack_id (COMPACT_STRING) — skipped
+ *   TAG_BUFFER
+ */
+bool parse_fetch_request(const uint8_t* data, size_t len, size_t offset,
+                         FetchRequest& req) {
+    // max_wait_ms(4) + min_bytes(4) + max_bytes(4) + isolation_level(1) +
+    // session_id(4) + session_epoch(4) = 21
+    if (offset + 21 > len) {
+        return false;
+    }
+    offset += 21;
+
+    // topics: COMPACT_ARRAY
+    uint32_t num_topics_raw;
+    size_t varint_bytes =
+        read_unsigned_varint(data, len, offset, num_topics_raw);
+    if (varint_bytes == 0) return false;
+    offset += varint_bytes;
+
+    if (num_topics_raw > 0) {
+        uint32_t num_topics = num_topics_raw - 1;
+        for (uint32_t i = 0; i < num_topics; ++i) {
+            // topic_id: UUID (16 bytes)
+            if (offset + 16 > len) {
+                return false;
+            }
+            std::array<uint8_t, 16> topic_id;
+            std::copy(data + offset, data + offset + 16, topic_id.begin());
+            offset += 16;
+            req.topics.push_back({topic_id, {}});
+
+            // partitions: COMPACT_ARRAY
+            uint32_t num_partitions_raw;
+            varint_bytes =
+                read_unsigned_varint(data, len, offset, num_partitions_raw);
+            if (varint_bytes == 0) return false;
+            offset += varint_bytes;
+
+            if (num_partitions_raw > 0) {
+                uint32_t num_partitions = num_partitions_raw - 1;
+                for (uint32_t j = 0; j < num_partitions; ++j) {
+                    // partition(4) + current_leader_epoch (4) + fetch_offset(8)
+                    // + last_fetched_epoch(4) + log_start_offset(8) +
+                    // partition_max_bytes(4)
+                    if (offset + 32 > len) return false;
+                    int32_t partition_index =
+                        (data[offset] << 24) | (data[offset + 1] << 16) |
+                        (data[offset + 2] << 8) | data[offset + 3];
+                    req.topics.back().partitions.push_back(partition_index);
+                    offset += 32;
+                    // TAG_BUFFER
+                    if (!skip_tag_buffer(data, len, offset)) return false;
+                }
+            }
+
+            // TAG_BUFFER per topic
+            if (!skip_tag_buffer(data, len, offset)) return false;
+        }
+    }
+
+    return true;
 }
 
 /*
@@ -1054,6 +1161,206 @@ std::map<std::string, TopicInfo> load_cluster_metadata() {
     return res;
 }
 
+std::vector<uint8_t> read_partition_log(const std::string& topic_name,
+                                        int32_t partition_id) {
+    std::string path = "/tmp/kraft-combined-logs/" + topic_name + "-" +
+                       std::to_string(partition_id) +
+                       "/00000000000000000000.log";
+    std::ifstream file(path, std::ios::binary);
+    if (!file) {
+        return {};
+    }
+
+    return {std::istreambuf_iterator<char>(file),
+            std::istreambuf_iterator<char>()};
+}
+
+/**
+ * Fetch Response v16 (flexible, response header v1):
+ *   throttle_time_ms (INT32)
+ *   error_code (INT16)
+ *   session_id (INT32)
+ *   responses (COMPACT_ARRAY):
+ *     topic_id (UUID)
+ *     partitions (COMPACT_ARRAY):
+ *       partition_index (INT32)
+ *       error_code (INT16)
+ *       high_watermark (INT64)
+ *       last_stable_offset (INT64)
+ *       log_start_offset (INT64)
+ *       aborted_transactions (COMPACT_NULLABLE_ARRAY)
+ *       preferred_read_replica (INT32)
+ *       records (COMPACT_RECORDS)
+ *       TAG_BUFFER
+ *     TAG_BUFFER
+ *   TAG_BUFFER
+ */
+std::vector<uint8_t> build_fetch_response(
+    const FetchRequest& req, const std::map<std::string, TopicInfo>& metadata) {
+    std::vector<uint8_t> body;
+
+    // build UUID -> TopicInfo lookup
+    // why?
+    std::map<std::array<uint8_t, 16>, const TopicInfo*> by_uuid;
+    for (const auto& [name, info] : metadata) {
+        by_uuid[info.topic_id] = &info;
+    }
+
+    // throttle_time_ms (INT32)
+    body.push_back(0x00);
+    body.push_back(0x00);
+    body.push_back(0x00);
+    body.push_back(0x00);
+
+    // error_code (INT16)
+    body.push_back(0x00);
+    body.push_back(0x00);
+
+    // session_id (INT32)
+    body.push_back(0x00);
+    body.push_back(0x00);
+    body.push_back(0x00);
+    body.push_back(0x00);
+
+    // responses: COMPACT_ARRAY
+    body.push_back(static_cast<uint8_t>(req.topics.size() + 1));
+
+    for (const auto& topic : req.topics) {
+        // topic_id: UUID (16 bytes)
+        body.insert(body.end(), topic.topic_id.begin(), topic.topic_id.end());
+
+        auto it = by_uuid.find(topic.topic_id);
+        bool topic_known = (it != by_uuid.end());
+        if (topic_known) {
+            const TopicInfo* topic_info = it->second;
+            // partition partitions: COMPACT_ARRAY
+            body.push_back(static_cast<uint8_t>(topic.partitions.size() + 1));
+            for (int32_t part_idx : topic.partitions) {
+                // partition_index (INT32)
+                body.push_back((part_idx >> 24) & 0xFF);
+                body.push_back((part_idx >> 16) & 0xFF);
+                body.push_back((part_idx >> 8) & 0xFF);
+                body.push_back(part_idx & 0xFF);
+
+                auto log_data = read_partition_log(topic_info->name, part_idx);
+
+                if (!log_data.empty() && log_data.size() >= 61) {
+                    // compute high_watermark from last RecordBatch in the file
+                    // For single-batch case: baseOffset(8 bytes) +
+                    // lastOffsetDelta(4 bytes at offset 23) + 1
+                    const uint8_t* b = log_data.data();
+                    int64_t base_offset =
+                        ((int64_t)b[0] << 56) | ((int64_t)b[1] << 48) |
+                        ((int64_t)b[2] << 40) | ((int64_t)b[3] << 32) |
+                        ((int64_t)b[4] << 24) | ((int64_t)b[5] << 16) |
+                        ((int64_t)b[6] << 8) | (int64_t)b[7];
+                    int32_t last_offset_data =
+                        (b[23] << 24) | (b[24] << 16) | (b[25] << 8) | b[26];
+                    int64_t high_watermark = base_offset + last_offset_data + 1;
+
+                    // error_code (INT16): ERROR_NONE
+                    body.push_back(0x00);
+                    body.push_back(0x00);
+
+                    // high_watermark (INT64)
+                    for (int i = 56; i >= 0; i -= 8)
+                        body.push_back((high_watermark >> i) & 0xFF);
+                    // last_stable_offset (INT64)
+                    for (int i = 56; i >= 0; i -= 8)
+                        body.push_back((high_watermark >> i) & 0xFF);
+                    // log_start_offset (INT64): 0
+                    for (int i = 0; i < 8; ++i) body.push_back(0x00);
+
+                    // aborted_transactions: COMPACT_NULLABLE_ARRAY (null = 0)
+                    body.push_back(0x00);
+
+                    // preferred_read_replica (INT32): -1
+                    body.push_back(0xFF);
+                    body.push_back(0xFF);
+                    body.push_back(0xFF);
+                    body.push_back(0xFF);
+
+                    // records: COMPACT_RECORDS (null = 0)
+                    append_unsigned_varint(
+                        body, static_cast<uint32_t>(log_data.size() + 1));
+                    body.insert(body.end(), log_data.begin(), log_data.end());
+                } else {
+                    // no data - zero offsets, null records
+                    // error_code (INT16): ERROR_NONE
+                    body.push_back(0x00);
+                    body.push_back(0x00);
+
+                    // high_watermark (INT64): 0
+                    for (int i = 0; i < 8; ++i) body.push_back(0x00);
+                    // last_stable_offset (INT64): 0
+                    for (int i = 0; i < 8; ++i) body.push_back(0x00);
+                    // log_start_offset (INT64): 0
+                    for (int i = 0; i < 8; ++i) body.push_back(0x00);
+
+                    // aborted_transactions: COMPACT_NULLABLE_ARRAY (null = 0)
+                    body.push_back(0x00);
+
+                    // preferred_read_replica (INT32): -1
+                    body.push_back(0xFF);
+                    body.push_back(0xFF);
+                    body.push_back(0xFF);
+                    body.push_back(0xFF);
+
+                    // records: COMPACT_RECORDS (null = 0)
+                    body.push_back(0x00);
+                }
+
+                // TAG_BUFFER (partition)
+                body.push_back(0x00);
+            }
+        } else {
+            // Unkown topic - single partition with error
+            // partitions: COMPACT_ARRAY (1 element, encoded as 2)
+            body.push_back(0x02);
+
+            // partition_index (INT32): 0
+            body.push_back(0x00);
+            body.push_back(0x00);
+            body.push_back(0x00);
+            body.push_back(0x00);
+
+            // error_code (INT16): 100 (UNKNOWN_TOPIC_ID)
+            body.push_back((ERROR_UNKNOWN_TOPIC_ID >> 8) & 0xFF);
+            body.push_back(ERROR_UNKNOWN_TOPIC_ID & 0xFF);
+
+            // high_watermark (INT64): -1
+            for (int i = 0; i < 8; ++i) body.push_back(0xFF);
+            // last_stable_offset (INT64): -1
+            for (int i = 0; i < 8; ++i) body.push_back(0xFF);
+            // log_start_offset (INT64): -1
+            for (int i = 0; i < 8; ++i) body.push_back(0xFF);
+
+            // aborted_transactions: COMPACT_NULLABLE_ARRAY (null = 0)
+            body.push_back(0x00);
+
+            // preferred_read_replica (INT32): -1
+            body.push_back(0xFF);
+            body.push_back(0xFF);
+            body.push_back(0xFF);
+            body.push_back(0xFF);
+
+            // records: COMPACT_RECORDS (null = 0)
+            body.push_back(0x00);
+
+            // TAG_BUFFER (partition)
+            body.push_back(0x00);
+        }
+
+        // TAG_BUFFER (topic)
+        body.push_back(0x00);
+    }
+
+    // TAG_BUFFER
+    body.push_back(0x00);
+
+    return body;
+}
+
 void handle_client(int client_fd) {
     while (true) {
         // read message size (4 bytes, big-endian)
@@ -1169,6 +1476,21 @@ void handle_client(int client_fd) {
                 build_response_v1(header.correlation_id, body);
             if (!write(client_fd, res.data(), res.size())) {
                 std::cerr << "Failed to send response!" << std::endl;
+                break;
+            }
+        } else if (header.request_api_key == FETCH) {
+            FetchRequest req;
+            if (!parse_fetch_request(request.data(), request.size(),
+                                     header_end_offset, req)) {
+                std::cerr << "Failed to parse Fetch request!" << std::endl;
+                break;
+            }
+            auto metadata = load_cluster_metadata();
+            std::vector<uint8_t> body = build_fetch_response(req, metadata);
+            std::vector<uint8_t> res =
+                build_response_v1(header.correlation_id, body);
+            if (!write(client_fd, res.data(), res.size())) {
+                std::cerr << "Failed to send Fetch response!" << std::endl;
                 break;
             }
         }
