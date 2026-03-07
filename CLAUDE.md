@@ -8,33 +8,43 @@ Whenever working with this codebase (or any codebase), ALWAYS ask me first about
 
 ALWAYS show me the code/implementation without me having to type `/plan` myself.
 
+_NEVER_ directly make changes to the source files under `src/`.
+
+Save all plans to the `.claude/` directory under local project's root.
+Do _NOT_ save plans to the home directory `~/`.
+
 ## Architecture
 
 This is a **Kafka broker implementation in C++23**. The server listens on port 9092 (standard Kafka broker port) for TCP connections.
 
-**Current state**: Early development — single-file implementation in `src/main.cpp` (~1400 lines). Supported APIs:
+**Current state**: Early development — single-file implementation in `src/main.cpp` (~2070 lines). Supported APIs:
+
+- **Produce** (API key 0, v0-11) — parses requests, writes RecordBatch data to partition log files under `/tmp/kraft-combined-logs/<topic>-<partition>/`, assigns baseOffset by walking existing batches; returns error for unknown topics
+- **Fetch** (API key 1, v0-16)
 - **ApiVersions** (API key 18, v0-4)
 - **DescribeTopicPartitions** (API key 75, v0)
-- **Fetch** (API key 1, v0-16)
 
 Reads KRaft cluster metadata from `/tmp/kraft-combined-logs/__cluster_metadata-0/00000000000000000000.log` to resolve topic/partition information; returns UNKNOWN_TOPIC_OR_PARTITION for topics not found in that log.
 
 **Connection model**: Multi-threaded — the main loop accepts connections and spawns a detached `std::thread` per client. Each thread runs `handle_client` in a loop until the client disconnects.
 
 **Request processing flow** (`handle_client`):
+
 1. Read 4-byte big-endian message size prefix
 2. Read the full message body
 3. Peek at `api_key` and `api_version` to select header parser via `uses_flexible_header()`:
-   - Non-flexible (header v1, `parse_request_header_v1`): ApiVersions v0-3. Fields: api_key, api_version, correlation_id, client_id (NULLABLE_STRING with int16 length prefix)
-   - Flexible (header v2, `parse_request_header_v2`): ApiVersions v4, DescribeTopicPartitions (always), Fetch v12+. Same fields as v1, plus TAG_BUFFER after client_id
+   - Non-flexible (header v1, `parse_request_header_v1`): ApiVersions v0-3, Produce v0-8, Fetch v0-11. Fields: api_key, api_version, correlation_id, client_id (NULLABLE_STRING with int16 length prefix)
+   - Flexible (header v2, `parse_request_header_v2`): ApiVersions v4, DescribeTopicPartitions (always), Fetch v12+, Produce v9+. Same fields as v1, plus TAG_BUFFER after client_id
 4. Dispatch to API handler based on api_key
 5. Build response:
    - ApiVersions: response header v0 (`build_response` — just correlation_id) + body
    - DescribeTopicPartitions / Fetch: response header v1 (`build_response_v1` — correlation_id + TAG_BUFFER) + body
+   - Produce: response header v0 for v0-8, response header v1 for v9+
 
 **Quirk**: ApiVersions v3 uses non-flexible header (v1) but has the v3+ body format (with COMPACT_STRING fields). The `uses_flexible_header()` check is `api_version > 3`, not `>= 3`. The body parser switches at `api_version >= 3`.
 
 **Metadata log parsing** (`load_cluster_metadata`):
+
 - Reads KRaft RecordBatch log file at a hardcoded path
 - Parses RecordBatch frames: 12-byte header (including batchLength at offset 8), records start at offset 61
 - Individual records use zigzag-encoded varints for length, timestamps, offsets, key/value lengths
@@ -42,17 +52,24 @@ Reads KRaft cluster metadata from `/tmp/kraft-combined-logs/__cluster_metadata-0
 - Recognizes TopicRecord (api_key=2) and PartitionRecord (api_key=3), builds a name->TopicInfo map
 - Partitions are associated with topics via UUID matching
 
+**Partition log I/O** (`read_partition_log` / `write_partition_log`):
+
+- Reads/writes partition data at `/tmp/kraft-combined-logs/<topic>-<partition>/00000000000000000000.log`
+- `write_partition_log` creates the directory if missing, walks existing batches to determine next baseOffset, patches baseOffset in the RecordBatch copy, then appends
+- `read_partition_log` returns raw bytes of the entire log file (used by Fetch responses)
+- Separate from KRaft cluster metadata — these are the actual message data logs
+
 **Kafka Protocol Notes**:
+
 - All integers are big-endian encoded on the wire
 - Messages: 4-byte size prefix + request/response body
 - COMPACT_ARRAY: length encoded as N+1 (where 0 means null)
 - COMPACT_STRING/COMPACT_NULLABLE_STRING: unsigned varint length (actual_length = encoded_length - 1)
 - Unsigned varints: little-endian, 7 data bits per byte, MSB is continuation flag
 - TAG_BUFFER: unsigned varint count of tagged fields, each with tag + size + data
+- Produce v0-8 uses non-flexible encoding (ARRAY with INT32 count, STRING with INT16 length); v9+ uses flexible (COMPACT_ARRAY, COMPACT_STRING, TAG_BUFFERs)
 
 **Note**: CURL is linked as a dependency but not yet used in the code.
-
-**Known issue**: Two places in `build_describe_topic_partitions_response` use the float literal `0.00` instead of `0x00` (lines 656, 664 in main.cpp). These compile and work (0.00 truncates to 0) but are technically wrong.
 
 ## Build Commands
 
